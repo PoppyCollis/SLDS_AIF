@@ -1,0 +1,66 @@
+def run_AIF()
+
+    next_obsevation = [0,0,1,0,0] # start at center point
+    
+    for i in range(num_discrete_steps):
+    
+        # infer state
+        qs = my_agent.infer_states(next_observation)
+        
+        # infer policies
+        q_pi, efe = my_agent.infer_policies_factorized()
+        chosen_action_id = my_agent.sample_action()
+    
+        # given qs, index the relevant linear dynamics models (A_continuous, b, initial_position)
+        A = A_continuous_list[chosen_action_id]
+        b = b_list[chosen_action_id]
+        x_init = x_init_list[chosen_action_id]
+    
+        # plug in those variables and run the continuous dynamics
+        x1, x2 = run_continuous(T, num_steps, x_init, A_cont, b) # integrate equation and 
+        
+        
+        if standard_SLDS:
+            '''
+            a standard SLDS just updates latent states and the continuous dynamics follow from this
+            we can't learn a B matrix as it can only ever assume that the action it took got it to the
+            state it expected to be in next.
+            
+            '''
+            # we get next state of the latent by applying relevant slice (given action we selected) of transition matrix to current state 
+            next_state = np,dot(B[...,chosen_action_id], qs) # get the relevant slice of the B matrix and update current state
+            next_observation = np.dot(A, next_state)
+            # note that the problem here is that if B matrix is unknown, how do we know what our next state truly is!
+            
+            
+            
+        if non_standard_SLDS:
+            '''
+            if we have any kind of uncertainty in our B matrix (i.e. if we are learning it from flat)
+            then we have to be able to infer our state after we apply an action (as we don't know where we 
+            will end up). i.e. we need to map from continuous space to a categorical observation. 
+            This is a bit more like Parr and Friston as now we want to incorporate a notion of a 'link function'.
+            
+            To do this we put Gaussian likelihoods around each of the fixed points in continuous space and 
+            then we just get the posterior probability over which Gaussian is most likely to have been responsible for producing 
+            the datapoint (this is the E-step in EM).
+            
+            '''
+
+            # Compute the unnormalized responsibilities (likelihoods * priors) assuming equal priors
+            responsibilities = [multivariate_normal.pdf(data_point, mean=mean, cov=covariance) for fixed_point_mean in fixed_point_means]
+            
+            # Normalize the responsibilities to get probabilities
+            probabilities = softmax(responsibilities)
+            
+            # argmax to get the most likely discrete state
+            state = np.argmax(responsibilities)
+            init_state = np.eye(len(fps))[state]
+            
+            # step through pymdp A matrix to get the next obervation
+            next_observation = np.dot(A, init_state)
+            
+            # now this alows us to update the B matrix
+            qB = my_agent.update_B(qs)
+ 
+            
