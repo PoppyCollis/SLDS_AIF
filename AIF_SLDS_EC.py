@@ -11,12 +11,15 @@ Equilibrium Control (EC)
 
 from pymdp import utils
 from agent import Agent
-from control_edit import *
+from control import *
 import ssm
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.stats import multivariate_normal
+from scipy.stats import norm
+import continuous_active_inference as caif
+from visualization import plot_system_control
 
 
 # In[] Construct linear dynamics
@@ -97,10 +100,10 @@ desired_fp = np.array([5,3])
 A_cont = create_A_decay(state_dim)  
 
 fp_0 = np.array([1e-2,1e-2])
-fp_1 = np.array([10,10])
-fp_2 = np.array([-10,10])
-fp_3 = np.array([-10,-10])
-fp_4 = np.array([10,-10])
+fp_1 = np.array([5,10])
+fp_2 = np.array([-5,10])
+fp_3 = np.array([-5,-10])
+fp_4 = np.array([5,-10])
 
 b0 = calculate_fp_biases(fp_0, A_cont)
 b1 = calculate_fp_biases(fp_1, A_cont)
@@ -113,7 +116,7 @@ bs = [b0,b1, b2, b3, b4]
 
 # for i in range(5):
 #     plot_streamplot_single(A_cont, bs[i])
-# print(f'fixed point = {np.dot(-np.linalg.inv(A), b)}')
+#print(f'fixed point = {np.dot(-np.linalg.inv(A), b)}')
 
 # In[] Construct discrete AIF controller
 
@@ -242,7 +245,7 @@ B_factor_list=None
 # create observation likelihood (A matrix)
 A = utils.initialize_empty_A(num_obs, num_states) 
 prob_A = 1. # confidence in A matrix
-fill_A(A, fully_known=True, prob=prob_A)
+fill_A(A, fully_known = True, prob=prob_A)
 dir_scale = 1.
 pA=utils.dirichlet_like(A,scale=dir_scale)
 
@@ -352,9 +355,54 @@ def run_continuous(T, num_steps, initial_condition, A, b, i):
 # plt.xlabel(r'$x1$')
 # plt.ylabel(r'$x2$')
 # plt.show()
+ 
+# I am expecting to input num time steps, initial condition, A and b and get back trajectory in x1, x2 space
+# maybe in this instance I am effectively just plugging in fixed points (not even b)?
 
 
-# In[] Plug into AIF agent
+def run_continuous_agent(eta, prior_P_f, continuous_agent, system):
+    # Receives the desired expected observation tau (desired goal of the system), the continuous agent and the system definition (dynamics, etc)
+
+    # expected_obs is an array of arrays - one array for each modality. 
+    # each of those arrays is a discrete probability funciton with a value for each of the psossible discrete outcomes for the modality. 
+  
+    # # just produces random L_m, for one modality
+    # posterior_obs=np.random.rand(expected_obs[0].shape[0])
+
+    # Unrol continous
+    F_action = 0
+    xd = np.array([[eta], [0]]) # Desired observation [position, velocity]
+    print('Prior_P_f', prior_P_f)
+    # continuous_agent.set_desired_precision(np.diag([prior_P_f[0][0], prior_P_f[0][0]])) # TODO prior_P_f should be 2-dim diag as it has position and velocity. Only encoding position.
+    # continuous_agent.set_desired_precision(np.diag([.01, .01])) # Original value
+
+    for i in range(0, system.nt - 1):
+        u, F, Pi_u = continuous_agent.run_aif_step(i, xd, system) # runs one step of VFE minimization (gradient)
+        system.update_state(i, u) # Generative process - take action in the world
+        F_action += F # Path Integral Free Energy
+    # End unrol continous
+
+    x0, y0, u0 = system.get_current_state() # provides current observation
+
+    # Return observations in the real world
+    o_prime = system.x.copy()
+
+    plot_system_control('position', system, xd, system.dt, system.nt)
+    system.clear_buffer() # TODO discuss how to initalize smoothly
+
+    return o_prime[0], o_prime[1]
+
+
+# Instantiate Contiuous Agent
+# params
+nt = 2000
+dt = .01 # 0.01
+# System
+system = caif.SMD(nt=nt, dt=dt) # Define type of system dynamics
+# Continuous active inference controller
+my_cont_agent = caif.ContiniousAIF(nx=system.nx, ny=system.ny, nu=system.nu)
+
+# In[] Link functions
 
 def calculate_responsibilities(data_point, means, covariance):
     """
@@ -379,12 +427,39 @@ def calculate_responsibilities(data_point, means, covariance):
     
     return probabilities
 
+def calculate_responsibilities_1d(data_point, means, variances):
+    """
+    Infer the categorical probability distribution of a given data point 
+    belonging to each component of a Gaussian mixture model.
+
+    Parameters:
+    - data_point: A 2D continuous data point (numpy array).
+    - means: A list of means (numpy arrays) for each Gaussian in the mixture.
+    - covariance: A shared diagonal covariance matrix (numpy array).
+
+    Returns:
+    - A numpy array representing the categorical probability distribution.
+    """
+    # Compute the unnormalized responsibilities (likelihoods * priors)
+    # Assuming equal priors since not specified
+    responsibilities = [norm.pdf(data_point, loc=mean, scale=np.sqrt(variance))
+                        for mean, variance in zip(means, variances)]
+    # Normalize the responsibilities to get probabilities
+    total = sum(responsibilities)
+    probabilities = np.array([resp / total for resp in responsibilities])
+    
+    return probabilities
+
+
+# In[] Plug into AIF agent
+
 def run_active_inference_step(num_runs, my_agent, init_state, T, num_steps, A_cont, bs, fps, fictive_step=False):
     
     x1s = np.zeros((num_runs, num_steps))
     x2s = np.zeros((num_runs, num_steps))
     
-    reward_locations = np.random.randint(0,5,num_runs)
+    # reward_locations = np.random.randint(0,5,num_runs)
+    reward_locations = np.array([1,2,3,4,1,2,3,4])
     print('reward locations: ', reward_locations)
     
     for i in range(num_runs):
@@ -400,7 +475,8 @@ def run_active_inference_step(num_runs, my_agent, init_state, T, num_steps, A_co
     
         my_agent.reset() # resets qs and q_pi to uniform
         # plug in end state of last AIF step directly into qs
-        my_agent.qs = init_state
+        next_observation = [np.argmax(init_state)]
+        qs = my_agent.infer_states(next_observation)
         print(my_agent.qs)
         
         # infer policies
@@ -414,7 +490,6 @@ def run_active_inference_step(num_runs, my_agent, init_state, T, num_steps, A_co
         x_init = fps[np.argmax(init_state)]
         # step the continuous dynamics
         x1, x2 = run_continuous(T, num_steps, x_init, A_cont, b, i)
-        x1_prev, x2_prev = x1, x2
         
         x1s[i] = x1
         x2s[i] = x2
@@ -441,13 +516,13 @@ def run_active_inference_step(num_runs, my_agent, init_state, T, num_steps, A_co
     plt.show()
     return x1s, x2s, init_state
 
-def run_active_inference_step_with_learning(num_runs, my_agent, init_state, T, num_steps, A_cont, bs, fps, fictive_step=False):
+def run_active_inference_step_with_learning(num_runs, my_agent, init_state, T, num_steps, A_cont, bs, fps, fictive_step = False):
     
     x1s = np.zeros((num_runs, num_steps))
     x2s = np.zeros((num_runs, num_steps))
     
     #reward_locations = np.random.randint(0,5,num_runs)
-    reward_locations = np.array([1,2,3,4,0,1,2,3,4,0])
+    reward_locations = np.array([1,2,3,4])
     print('reward locations: ', reward_locations)
     
     for i in range(num_runs):
@@ -485,7 +560,6 @@ def run_active_inference_step_with_learning(num_runs, my_agent, init_state, T, n
         x_init = fps[np.argmax(init_state)]
         # step the continuous dynamics
         x1, x2 = run_continuous(T, num_steps, x_init, A_cont, b, i)
-        x1_prev, x2_prev = x1, x2
         
         x1s[i] = x1
         x2s[i] = x2
@@ -517,23 +591,95 @@ def run_active_inference_step_with_learning(num_runs, my_agent, init_state, T, n
     return x1s, x2s, init_state
 
 
+def run_active_inference_step_CAIF(num_runs, my_agent, init_state, fps, nt, dt, system, my_cont_agent, fictive_step=True):
+    
+    x1s = np.zeros((num_runs, nt))
+    x2s = np.zeros((num_runs, nt))
+    
+    # note for CAIF, position in just 1 dimensional
+    fps = [0,1,2,3,4] # 5 positions on a 1D plane so fps are same as self.etas
+    
+    reward_locations = np.random.randint(0,5,num_runs)
+    # reward_locations = np.array([1,2,3,4])
+    print('reward locations: ', reward_locations)
+    
+    for i in range(num_runs):
+        
+        # create prior preference over observations (C vector)
+        reward_location = reward_locations[i]
+        punish, reward = 0, 20
+        C = utils.obj_array_uniform(num_obs)
+        C[0][:] = punish
+        C[0][reward_location] = reward
+        my_agent.C = C
+    
+        my_agent.reset() # resets qs and q_pi to uniform
+        # plug in end state of last AIF step directly into qs
+        next_observation = [np.argmax(init_state)]
+        qs = my_agent.infer_states(next_observation)
+        print(my_agent.qs)
+        
+        # update A and B matrices 
+        if i > 0: # the action carried out to initilise shouldn't be used for learning
+            qA = my_agent.update_A(next_observation)   
+            qB = my_agent.update_B(qs_prev)
+        
+        qs_prev = qs
+        
+        # infer policies
+        q_pi, efe = my_agent.infer_policies_factorized()
+        chosen_action_id = my_agent.sample_action()
+        
+        # find which fp is indexed by the action
+        eta = fps[int(chosen_action_id[0][0])]
+        
+        # given initial state, init continuous dynamics from relevant coordinates
+        x_init = fps[np.argmax(init_state)]
+        
+        prior_P_f= np.diag(np.ones(1) * 0.1)
+        
+        
+        # step the continuous dynamics
+        x1, x2 = run_continuous_agent(eta, prior_P_f, my_cont_agent, system)
+        
+        x1s[i] = x1
+        x2s[i] = x2
+        
+        if fictive_step:
+            # from continuous coordinate, infer posterior responsibilities (E-step)
+            sigmas = np.ones(len(fps)) # shared diagonal covariance 
+            # calculate 1D responsibilities from normal distributions
+            responsibilities = calculate_responsibilities_1d(np.array([x1[-1]]), fps, sigmas)
+            state = np.argmax(responsibilities)
+            init_state = np.eye(len(fps))[state]
+    
+        else:
+            # just get next state by applying transition matrix and action
+            transition = B[0][...,int(chosen_action_id[0][0])]
+            init_state = np.dot(transition, init_state)
+        
+    for i in range(num_runs):
+        plt.plot(x1s[i], x2s[i])
+    plt.xlim(-5,5)
+    plt.ylim(-5,5)
+    plt.title(f'Full Trajectory')
+    plt.xlabel(r'$x1$')
+    plt.ylabel(r'$x2$')
+    plt.show()
+    return x1s, x2s
+    
+# In[] Run experiment
 
-num_runs = 10
+num_runs = 50
 T = 10
 num_steps = 100
-init_state = np.array([1,0,0,0,0]) # start at center
+init_state = np.array([0,1,0,0,0]) # start at top-right
+
+# x1s, x2s, init_state = run_active_inference_step(num_runs, my_agent, init_state, T, num_steps, A_cont, bs, fps, fictive_step=True)
+# x1s, x2s, init_state = run_active_inference_step_with_learning(num_runs, my_agent, init_state, T, num_steps, A_cont, bs, fps, fictive_step=True)
+x1s, x2s = run_active_inference_step_CAIF(num_runs, my_agent, init_state, fps, nt, dt, system, my_cont_agent, fictive_step=True)
 
 
-x1s, x2s, init_state = run_active_inference_step_with_learning(num_runs, my_agent, init_state, T, num_steps, A_cont, bs, fps, fictive_step=True)
-
-
-    
-
-
-            
-                
-    
-    
     
     
 
